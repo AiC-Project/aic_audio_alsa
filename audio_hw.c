@@ -22,10 +22,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include <cutils/log.h>
 #include <cutils/properties.h>
 #include <cutils/str_parms.h>
+#include <cutils/sockets.h>
 
 #include <hardware/audio.h>
 #include <hardware/hardware.h>
@@ -36,13 +39,21 @@
 
 #include <audio_utils/resampler.h>
 
-#include "audio_route.h"
+#define AIC_PCM_SERVER_PORT 24296
 
-#define PCM_CARD 1
+/* Mixer control names */
+#define MIXER_MASTER_PLAYBACK_VOLUME    "Master Playback Volume"
+#define MIXER_MASTER_PLAYBACK_SWITCH    "Master Playback Switch"
+#define MIXER_PCM_PLAYBACK_VOLUME       "PCM Playback Volume"
+#define MIXER_PCM_PLAYBACK_SWITCH       "PCM Playback Switch"
+#define MIXER_CAPTURE_SOURCE            "Capture Source"
+#define MIXER_CAPTURE_SWITCH            "Capture Switch"
+#define MIXER_CAPTURE_VOLUME            "Capture Volume"
+
+#define PCM_CARD 0
 #define PCM_DEVICE 0
-#define PCM_DEVICE_SCO 2
 
-#define OUT_PERIOD_SIZE 880
+#define OUT_PERIOD_SIZE 512
 #define OUT_SHORT_PERIOD_COUNT 2
 #define OUT_LONG_PERIOD_COUNT 8
 #define OUT_SAMPLING_RATE 44100
@@ -85,22 +96,14 @@ struct pcm_config pcm_config_in = {
     .stop_threshold = (IN_PERIOD_SIZE * IN_PERIOD_COUNT),
 };
 
-struct pcm_config pcm_config_sco = {
-    .channels = 1,
-    .rate = SCO_SAMPLING_RATE,
-    .period_size = SCO_PERIOD_SIZE,
-    .period_count = SCO_PERIOD_COUNT,
-    .format = PCM_FORMAT_S16_LE,
-};
-
 struct audio_device {
     struct audio_hw_device hw_device;
 
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
-    unsigned int devices;
+    unsigned int out_device;
+    unsigned int in_device;
     bool standby;
     bool mic_mute;
-    struct audio_route *ar;
     int orientation;
     bool screen_off;
 
@@ -125,6 +128,7 @@ struct stream_out {
     int buffer_type;
 
     struct audio_device *dev;
+    int pcm_server_socket;
 };
 
 struct stream_in {
@@ -174,6 +178,7 @@ static void release_buffer(struct resampler_buffer_provider *buffer_provider,
 
 static void select_devices(struct audio_device *adev)
 {
+/*
     int headphone_on;
     int speaker_on;
     int main_mic_on;
@@ -200,6 +205,7 @@ static void select_devices(struct audio_device *adev)
 
     ALOGV("hp=%c speaker=%c main-mic=%c", headphone_on ? 'y' : 'n',
           speaker_on ? 'y' : 'n', main_mic_on ? 'y' : 'n');
+*/
 }
 
 /* must be called with hw device and output stream mutexes locked */
@@ -251,20 +257,9 @@ static int start_output_stream(struct stream_out *out)
     unsigned int device;
     int ret;
 
-    /*
-     * Due to the lack of sample rate converters in the SoC,
-     * it greatly simplifies things to have only the main
-     * (speaker/headphone) PCM or the BC SCO PCM open at
-     * the same time.
-     */
-    if (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO) {
-        device = PCM_DEVICE_SCO;
-        out->pcm_config = &pcm_config_sco;
-    } else {
-        device = PCM_DEVICE;
-        out->pcm_config = &pcm_config_out;
-        out->buffer_type = OUT_BUFFER_TYPE_UNKNOWN;
-    }
+    device = PCM_DEVICE;
+    out->pcm_config = &pcm_config_out;
+    out->buffer_type = OUT_BUFFER_TYPE_UNKNOWN;
 
     /*
      * All open PCMs can only use a single group of rates at once:
@@ -283,10 +278,18 @@ static int start_output_stream(struct stream_out *out)
         pthread_mutex_unlock(&adev->active_in->lock);
     }
 
+    static int already_tried = 0;
+pcm_config_out_tryagain:
     out->pcm = pcm_open(PCM_CARD, device, PCM_OUT | PCM_NORESTART, out->pcm_config);
 
     if (out->pcm && !pcm_is_ready(out->pcm)) {
         ALOGE("pcm_open(out) failed: %s", pcm_get_error(out->pcm));
+        if (!already_tried) {
+          out->pcm_config->rate--;
+          ALOGE("pcm_open(out) try now with config rate = %d", out->pcm_config->rate);
+          already_tried++;
+          goto pcm_config_out_tryagain;
+        }
         pcm_close(out->pcm);
         return -ENOMEM;
     }
@@ -320,18 +323,8 @@ static int start_input_stream(struct stream_in *in)
     unsigned int device;
     int ret;
 
-    /*
-     * Due to the lack of sample rate converters in the SoC,
-     * it greatly simplifies things to have only the main
-     * mic PCM or the BC SCO PCM open at the same time.
-     */
-    if (adev->devices & AUDIO_DEVICE_IN_ALL_SCO) {
-        device = PCM_DEVICE_SCO;
-        in->pcm_config = &pcm_config_sco;
-    } else {
-        device = PCM_DEVICE;
-        in->pcm_config = &pcm_config_in;
-    }
+    device = PCM_DEVICE;
+    in->pcm_config = &pcm_config_in;
 
     /*
      * All open PCMs can only use a single group of rates at once:
@@ -376,6 +369,7 @@ static int start_input_stream(struct stream_in *in)
     in->buffer_size = pcm_frames_to_bytes(in->pcm,
                                           in->pcm_config->period_size);
     in->buffer = malloc(in->buffer_size);
+    in->frames_in = 0;
 
     adev->active_in = in;
 
@@ -547,20 +541,19 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
     pthread_mutex_lock(&adev->lock);
     if (ret >= 0) {
         val = atoi(value);
-        if (((adev->devices & AUDIO_DEVICE_OUT_ALL) != val) && (val != 0)) {
+        if ((adev->out_device != val) && (val != 0)) {
             /*
              * If SCO is turned on/off, we need to put audio into standby
              * because SCO uses a different PCM.
              */
             if ((val & AUDIO_DEVICE_OUT_ALL_SCO) ^
-                    (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO)) {
+                    (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO)) {
                 pthread_mutex_lock(&out->lock);
                 do_out_standby(out);
                 pthread_mutex_unlock(&out->lock);
             }
 
-            adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
-            adev->devices |= val;
+            adev->out_device = val;
             select_devices(adev);
         }
     }
@@ -583,7 +576,7 @@ static uint32_t out_get_latency(const struct audio_stream_out *stream)
 
     pthread_mutex_lock(&adev->lock);
 
-    if (adev->screen_off && !adev->active_in && !(adev->devices & AUDIO_DEVICE_OUT_ALL_SCO))
+    if (adev->screen_off && !adev->active_in && !(adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO))
         period_count = OUT_LONG_PERIOD_COUNT;
     else
         period_count = OUT_SHORT_PERIOD_COUNT;
@@ -631,7 +624,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
     }
     buffer_type = (adev->screen_off && !adev->active_in) ?
             OUT_BUFFER_TYPE_LONG : OUT_BUFFER_TYPE_SHORT;
-    sco_on = (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO);
+    sco_on = (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO);
     pthread_mutex_unlock(&adev->lock);
 
     /* detect changes in screen ON/OFF state and adapt buffer size
@@ -685,8 +678,10 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
             struct timespec time_stamp;
             if (pcm_get_htimestamp(out->pcm,
                                    (unsigned int *)&kernel_frames,
-                                   &time_stamp) < 0)
+                                   &time_stamp) < 0) {
+                kernel_frames = -1;
                 break;
+            }
             kernel_frames = pcm_get_buffer_size(out->pcm) - kernel_frames;
 
             if (kernel_frames > out->cur_write_threshold) {
@@ -725,12 +720,17 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
             if (out->cur_write_threshold > out->write_threshold) {
                 out->cur_write_threshold = out->write_threshold;
             }
-        } else if ((kernel_frames < out->write_threshold) &&
+        } else if ((kernel_frames != -1) && (kernel_frames < out->write_threshold) &&
             ((out->write_threshold - kernel_frames) >
                 (int)(period_size * OUT_SHORT_PERIOD_COUNT))) {
             out->cur_write_threshold = (kernel_frames / period_size + 1) * period_size;
             out->cur_write_threshold += period_size / 4;
         }
+    }
+
+    if(out->pcm_server_socket) {
+        // pcm server connected, send audio data
+         write(out->pcm_server_socket, in_buffer, out_frames * frame_size);
     }
 
     ret = pcm_write(out->pcm, in_buffer, out_frames * frame_size);
@@ -851,21 +851,20 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
                             value, sizeof(value));
     pthread_mutex_lock(&adev->lock);
     if (ret >= 0) {
-        val = atoi(value);
-        if (((adev->devices & AUDIO_DEVICE_IN_ALL) != val) && (val != 0)) {
+        val = atoi(value) & ~AUDIO_DEVICE_BIT_IN;
+        if ((adev->in_device != val) && (val != 0)) {
             /*
              * If SCO is turned on/off, we need to put audio into standby
              * because SCO uses a different PCM.
              */
             if ((val & AUDIO_DEVICE_IN_ALL_SCO) ^
-                    (adev->devices & AUDIO_DEVICE_IN_ALL_SCO)) {
+                    (adev->in_device & AUDIO_DEVICE_IN_ALL_SCO)) {
                 pthread_mutex_lock(&in->lock);
                 do_in_standby(in);
                 pthread_mutex_unlock(&in->lock);
             }
 
-            adev->devices &= ~AUDIO_DEVICE_IN_ALL;
-            adev->devices |= val;
+            adev->in_device = val;
             select_devices(adev);
         }
     }
@@ -970,6 +969,73 @@ static int in_remove_audio_effect(const struct audio_stream *stream,
 }
 
 
+static void *start_pcm_server(void* arg)
+{
+    struct stream_out *out = (struct stream_out *)arg;
+
+    ALOGI("out sampling rate %d", pcm_config_out.rate);
+
+    // Wait forever for a new connection
+    while(1) {
+        int ssocket;
+        int csocket;
+
+        ssocket = socket_inaddr_any_server(AIC_PCM_SERVER_PORT, SOCK_STREAM);
+
+        if (ssocket < 0) {
+            ALOGE("Unable to start listening pcm server");
+            break;
+        }
+
+        // waiting for new connection
+        csocket = accept(ssocket, NULL, NULL);
+
+        if (csocket < 0) {
+            ALOGE("Unable to accept connection to pcm server");
+            close(ssocket);
+            break;
+        }
+
+        ALOGI("pcm server connected");
+
+        int opt_nodelay = 1;
+        setsockopt(csocket, IPPROTO_TCP, TCP_NODELAY, &opt_nodelay, sizeof(opt_nodelay));
+
+        close(ssocket);
+
+        ALOGI("pcm server starting");
+        out->pcm_server_socket = csocket;
+
+        // Waiting forever for new messages
+        while(1) {
+            fd_set set_read;
+            char buf;
+
+            FD_ZERO(&set_read);
+            FD_SET(csocket, &set_read);
+
+            if(select(csocket+1, &set_read, NULL, NULL, NULL) <= 0) {
+                ALOGE("pcm server error during select");
+                break;
+            }
+
+            // When a client socket disconnect, select signal read activity
+            // on the corresponding socket, but read operation will return zero
+            // bytes. This is the best way to detect disconnection
+            if(read(csocket, &buf, 1) <= 0) {
+                ALOGI("pcm server lost connection");
+                break;
+            }
+        }
+        // Close and wait for a new connection
+        out->pcm_server_socket = 0;
+        close(csocket);
+        ALOGI("pcm server closed");
+    }
+
+    return NULL;
+}
+
 static int adev_open_output_stream(struct audio_hw_device *dev,
                                    audio_io_handle_t handle,
                                    audio_devices_t devices,
@@ -1012,6 +1078,15 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     out->standby = true;
 
     *stream_out = &out->stream;
+
+    ALOGI("Starting pcm server");
+    pthread_t server_thread;
+    out->pcm_server_socket = 0;
+    // Device open, start a new pcm server in a different thread
+    if (pthread_create(&server_thread, NULL, start_pcm_server, (void*)out)) {
+        ALOGE("Unable to create pcm_server_open thread");
+    }
+
     return 0;
 
 err_open:
@@ -1023,6 +1098,7 @@ err_open:
 static void adev_close_output_stream(struct audio_hw_device *dev,
                                      struct audio_stream_out *stream)
 {
+    ALOGI("adev_close_output_stream");
     out_standby(&stream->common);
     free(stream);
 }
@@ -1202,26 +1278,25 @@ static int adev_close(hw_device_t *device)
 {
     struct audio_device *adev = (struct audio_device *)device;
 
-    audio_route_free(adev->ar);
+    //audio_route_free(adev->ar);
 
     free(device);
     return 0;
 }
 
-static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
+static int set_mixer_value_int(struct mixer *mixer, char *value_name, int value)
 {
-    return (/* OUT */
-            AUDIO_DEVICE_OUT_SPEAKER |
-            AUDIO_DEVICE_OUT_WIRED_HEADSET |
-            AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
-            AUDIO_DEVICE_OUT_ALL_SCO |
-            AUDIO_DEVICE_OUT_DEFAULT |
-            /* IN */
-            AUDIO_DEVICE_IN_BUILTIN_MIC |
-            AUDIO_DEVICE_IN_WIRED_HEADSET |
-            AUDIO_DEVICE_IN_BACK_MIC |
-            AUDIO_DEVICE_IN_ALL_SCO |
-            AUDIO_DEVICE_IN_DEFAULT);
+    struct mixer_ctl *ctl;
+    int j;
+
+    ctl = mixer_get_ctl_by_name(mixer, value_name);
+    if (!ctl)
+        return -EINVAL;
+
+    for (j = 0;j < mixer_ctl_get_num_values(ctl); j++)
+        mixer_ctl_set_value(ctl, j, value);
+
+    return 0;
 }
 
 static int adev_open(const hw_module_t* module, const char* name,
@@ -1238,11 +1313,10 @@ static int adev_open(const hw_module_t* module, const char* name,
         return -ENOMEM;
 
     adev->hw_device.common.tag = HARDWARE_DEVICE_TAG;
-    adev->hw_device.common.version = AUDIO_DEVICE_API_VERSION_1_0;
+    adev->hw_device.common.version = AUDIO_DEVICE_API_VERSION_2_0;
     adev->hw_device.common.module = (struct hw_module_t *) module;
     adev->hw_device.common.close = adev_close;
 
-    adev->hw_device.get_supported_devices = adev_get_supported_devices;
     adev->hw_device.init_check = adev_init_check;
     adev->hw_device.set_voice_volume = adev_set_voice_volume;
     adev->hw_device.set_master_volume = adev_set_master_volume;
@@ -1258,8 +1332,22 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.close_input_stream = adev_close_input_stream;
     adev->hw_device.dump = adev_dump;
 
-    adev->ar = audio_route_init();
     adev->orientation = ORIENTATION_UNDEFINED;
+    adev->out_device = AUDIO_DEVICE_OUT_SPEAKER;
+    adev->in_device = AUDIO_DEVICE_IN_BUILTIN_MIC & ~AUDIO_DEVICE_BIT_IN;
+
+    struct mixer *mmixer = mixer_open(0);
+    if (!mmixer) {
+        ALOGE("Error in mixer_open");
+        return -1;
+    }
+
+    set_mixer_value_int(mmixer, MIXER_MASTER_PLAYBACK_SWITCH, 1);
+    set_mixer_value_int(mmixer, MIXER_MASTER_PLAYBACK_VOLUME, 20);
+    set_mixer_value_int(mmixer, MIXER_PCM_PLAYBACK_SWITCH, 1);
+    set_mixer_value_int(mmixer, MIXER_PCM_PLAYBACK_VOLUME, 20);
+    set_mixer_value_int(mmixer, MIXER_CAPTURE_SWITCH, 1);
+    set_mixer_value_int(mmixer, MIXER_CAPTURE_VOLUME, 20);
 
     *device = &adev->hw_device.common;
 
@@ -1276,7 +1364,7 @@ struct audio_module HAL_MODULE_INFO_SYM = {
         .module_api_version = AUDIO_MODULE_API_VERSION_0_1,
         .hal_api_version = HARDWARE_HAL_API_VERSION,
         .id = AUDIO_HARDWARE_MODULE_ID,
-        .name = "Grouper audio HW HAL",
+        .name = "AicVM audio HW HAL",
         .author = "The Android Open Source Project",
         .methods = &hal_module_methods,
     },
